@@ -10,11 +10,111 @@ from artisan.schemas.enums import TablePath
 from artisan.storage.core.table_schemas import (
     ARTIFACT_EDGES_SCHEMA,
     ARTIFACT_INDEX_SCHEMA,
+    EXECUTION_EDGES_SCHEMA,
+    EXECUTIONS_SCHEMA,
 )
-from artisan.storage.io.commit import DeltaCommitter
+from artisan.storage.io.commit import CommitFailureError, DeltaCommitter
 from artisan.storage.io.staging import StagingArea, StagingManager
 
 METRICS_SCHEMA = MetricArtifact.POLARS_SCHEMA
+
+
+def _stage_execution_batch(
+    staging_root: str,
+    fs,
+    *,
+    batch_id: str = "test",
+    execution_run_id: str = "exec_001",
+    execution_spec_id: str = "spec_001",
+    artifact_id: str = "a" * 32,
+    include_metrics: bool = True,
+    include_index: bool = True,
+    include_execution_edges: bool = True,
+    include_artifact_edges: bool = False,
+) -> StagingArea:
+    """Stage a minimally complete execution batch for commit/recovery tests."""
+    staging = StagingArea(staging_root, fs, batch_id=batch_id)
+
+    exec_df = pl.DataFrame(
+        {
+            "execution_run_id": [execution_run_id],
+            "execution_spec_id": [execution_spec_id],
+            "step_run_id": [None],
+            "origin_step_number": [0],
+            "operation_name": ["TestOp"],
+            "params": ["{}"],
+            "user_overrides": ["{}"],
+            "timestamp_start": [None],
+            "timestamp_end": [None],
+            "source_worker": [0],
+            "compute_backend": ["local"],
+            "success": [True],
+            "error": [None],
+            "tool_output": [None],
+            "worker_log": [None],
+            "metadata": ["{}"],
+        },
+        schema=EXECUTIONS_SCHEMA,
+    )
+    staging.stage_dataframe(exec_df, "executions")
+
+    if include_execution_edges:
+        edges_df = pl.DataFrame(
+            {
+                "execution_run_id": [execution_run_id],
+                "direction": ["output"],
+                "role": ["metric"],
+                "artifact_id": [artifact_id],
+            },
+            schema=EXECUTION_EDGES_SCHEMA,
+        )
+        staging.stage_dataframe(edges_df, "execution_edges")
+
+    if include_metrics:
+        metrics_df = pl.DataFrame(
+            {
+                "artifact_id": [artifact_id],
+                "origin_step_number": [0],
+                "content": [b'{"score": 0.5}'],
+                "original_name": ["test"],
+                "extension": [".json"],
+                "metadata": ["{}"],
+                "external_path": [None],
+            },
+            schema=METRICS_SCHEMA,
+        )
+        staging.stage_dataframe(metrics_df, "metrics")
+
+    if include_index:
+        index_df = pl.DataFrame(
+            {
+                "artifact_id": [artifact_id],
+                "artifact_type": ["metric"],
+                "origin_step_number": [0],
+                "metadata": ["{}"],
+            },
+            schema=ARTIFACT_INDEX_SCHEMA,
+        )
+        staging.stage_dataframe(index_df, "index")
+
+    if include_artifact_edges:
+        artifact_edges_df = pl.DataFrame(
+            {
+                "execution_run_id": [execution_run_id],
+                "source_artifact_id": ["s" * 32],
+                "target_artifact_id": [artifact_id],
+                "source_artifact_type": ["data"],
+                "target_artifact_type": ["metric"],
+                "source_role": ["data"],
+                "target_role": ["score"],
+                "group_id": [None],
+                "step_boundary": [True],
+            },
+            schema=ARTIFACT_EDGES_SCHEMA,
+        )
+        staging.stage_dataframe(artifact_edges_df, "artifact_edges")
+
+    return staging
 
 
 @pytest.fixture
@@ -167,40 +267,15 @@ class TestDeltaCommitter:
         """Commit all staged tables at once."""
         committer, fs, _storage, _delta_root, staging_root = commit_env
 
-        # Stage multiple tables
-        staging = StagingArea(staging_root, fs, batch_id="test")
-
-        metrics_df = pl.DataFrame(
-            {
-                "artifact_id": ["a" * 32],
-                "origin_step_number": [0],
-                "content": [b'{"score": 0.5}'],
-                "original_name": ["test"],
-                "extension": [".json"],
-                "metadata": ["{}"],
-                "external_path": [None],
-            },
-            schema=METRICS_SCHEMA,
-        )
-
-        index_df = pl.DataFrame(
-            {
-                "artifact_id": ["a" * 32],
-                "artifact_type": ["data"],
-                "origin_step_number": [0],
-                "metadata": ["{}"],
-            },
-            schema=ARTIFACT_INDEX_SCHEMA,
-        )
-
-        staging.stage_dataframe(metrics_df, "metrics")
-        staging.stage_dataframe(index_df, "index")
+        _stage_execution_batch(staging_root, fs, batch_id="test")
 
         # Commit all
         results = committer.commit_all_tables(cleanup_staging=False)
 
         assert "metrics" in results
         assert "index" in results
+        assert "executions" in results
+        assert "execution_edges" in results
         assert results["metrics"] == 1
         assert results["index"] == 1
 
@@ -208,27 +283,93 @@ class TestDeltaCommitter:
         """Commit all cleans up staging by default."""
         committer, fs, _storage, _delta_root, staging_root = commit_env
 
-        # Stage data
-        staging = StagingArea(staging_root, fs, batch_id="test")
-        df = pl.DataFrame(
-            {
-                "artifact_id": ["a" * 32],
-                "origin_step_number": [0],
-                "content": [b'{"score": 0.5}'],
-                "original_name": ["test"],
-                "extension": [".json"],
-                "metadata": ["{}"],
-                "external_path": [None],
-            },
-            schema=METRICS_SCHEMA,
-        )
-        staging.stage_dataframe(df, "metrics")
+        _stage_execution_batch(staging_root, fs, batch_id="test")
 
         # Commit with cleanup
         committer.commit_all_tables(cleanup_staging=True)
 
         # Staging should be empty
         assert committer.staging_manager.list_batch_ids() == []
+
+    def test_commit_all_tables_preserves_failed_staging(self, commit_env):
+        """Failed incremental commit leaves staging in place for retry."""
+        committer, fs, storage, delta_root, staging_root = commit_env
+        _stage_execution_batch(staging_root, fs, batch_id="test")
+
+        original_commit_dataframe = committer.commit_dataframe
+
+        def flaky_commit_dataframe(df, table, *args, **kwargs):
+            if table == TablePath.EXECUTIONS.value:
+                msg = "Disk full"
+                raise OSError(msg)
+            return original_commit_dataframe(df, table, *args, **kwargs)
+
+        committer.commit_dataframe = flaky_commit_dataframe
+
+        with pytest.raises(CommitFailureError, match="Disk full"):
+            committer.commit_all_tables(cleanup_staging=True)
+
+        remaining = fs.glob(f"{staging_root}/**/*.parquet")
+        assert remaining
+
+        # Partial tables may already exist; retry must not duplicate them.
+        committer.commit_dataframe = original_commit_dataframe
+        retry_results = committer.commit_all_tables(cleanup_staging=True)
+
+        assert retry_results.get("executions") == 1
+        assert retry_results.get("metrics", 0) == 0
+        assert retry_results.get("index", 0) == 0
+        assert retry_results.get("execution_edges", 0) == 0
+
+        storage_options = storage.delta_storage_options()
+        assert (
+            pl.read_delta(
+                f"{delta_root}/artifacts/metrics",
+                storage_options=storage_options,
+            ).shape[0]
+            == 1
+        )
+        assert (
+            pl.read_delta(
+                f"{delta_root}/artifacts/index",
+                storage_options=storage_options,
+            ).shape[0]
+            == 1
+        )
+        assert (
+            pl.read_delta(
+                f"{delta_root}/provenance/execution_edges",
+                storage_options=storage_options,
+            ).shape[0]
+            == 1
+        )
+        assert (
+            pl.read_delta(
+                f"{delta_root}/orchestration/executions",
+                storage_options=storage_options,
+            ).shape[0]
+            == 1
+        )
+
+    def test_commit_all_tables_requires_execution_record(self, commit_env):
+        """Incremental commit rejects staged directories without executions.parquet."""
+        committer, fs, _storage, _delta_root, staging_root = commit_env
+        _stage_execution_batch(
+            staging_root,
+            fs,
+            batch_id="bad_batch",
+            include_index=False,
+            include_execution_edges=False,
+        )
+        fs.rm(f"{staging_root}/bad_batch/executions.parquet")
+
+        with pytest.raises(
+            CommitFailureError,
+            match="missing required executions.parquet",
+        ):
+            committer.commit_all_tables(cleanup_staging=True)
+
+        assert fs.exists(f"{staging_root}/bad_batch/metrics.parquet")
 
     def test_commit_batch_specific(self, commit_env):
         """Commit only a specific batch."""
@@ -542,23 +683,17 @@ class TestArtifactEdgesCommit:
         """artifact_edges is committed in correct order."""
         committer, fs, _storage, delta_root, staging_root = commit_env
 
-        # Stage artifact_edges data
-        staging = StagingArea(staging_root, fs, batch_id="test")
-        prov_df = pl.DataFrame(
-            {
-                "execution_run_id": ["e" * 32],
-                "source_artifact_id": ["s" * 32],
-                "target_artifact_id": ["t" * 32],
-                "source_artifact_type": ["data"],
-                "target_artifact_type": ["metric"],
-                "source_role": ["data"],
-                "target_role": ["score"],
-                "group_id": [None],
-                "step_boundary": [True],
-            },
-            schema=ARTIFACT_EDGES_SCHEMA,
+        _stage_execution_batch(
+            staging_root,
+            fs,
+            batch_id="test",
+            execution_run_id="e" * 32,
+            artifact_id="t" * 32,
+            include_metrics=False,
+            include_index=False,
+            include_execution_edges=False,
+            include_artifact_edges=True,
         )
-        staging.stage_dataframe(prov_df, "artifact_edges")
 
         # Commit
         results = committer.commit_all_tables(cleanup_staging=False)
@@ -571,23 +706,17 @@ class TestArtifactEdgesCommit:
         """artifact_edges is NOT partitioned by step number."""
         committer, fs, _storage, delta_root, staging_root = commit_env
 
-        # Stage artifact_edges data
-        staging = StagingArea(staging_root, fs, batch_id="test")
-        prov_df = pl.DataFrame(
-            {
-                "execution_run_id": ["e" * 32],
-                "source_artifact_id": ["s" * 32],
-                "target_artifact_id": ["t" * 32],
-                "source_artifact_type": ["data"],
-                "target_artifact_type": ["metric"],
-                "source_role": ["data"],
-                "target_role": ["score"],
-                "group_id": [None],
-                "step_boundary": [True],
-            },
-            schema=ARTIFACT_EDGES_SCHEMA,
+        _stage_execution_batch(
+            staging_root,
+            fs,
+            batch_id="test",
+            execution_run_id="e" * 32,
+            artifact_id="t" * 32,
+            include_metrics=False,
+            include_index=False,
+            include_execution_edges=False,
+            include_artifact_edges=True,
         )
-        staging.stage_dataframe(prov_df, "artifact_edges")
 
         committer.commit_all_tables(cleanup_staging=False)
 

@@ -162,6 +162,31 @@ class TestRecordOperations:
         row = failed.row(0, named=True)
         assert row["error"] == "Something went wrong"
 
+    def test_record_failed_with_result_metadata(self, tmp_path):
+        """Failed row can retain counts and commit diagnostics."""
+        tracker = StepTracker(str(tmp_path), "run_1")
+        record = _make_start_record()
+        result = _make_step_result(succeeded_count=3, failed_count=1).model_copy(
+            update={
+                "metadata": {
+                    "commit_error": "Disk full",
+                    "terminal_failure": "commit",
+                }
+            }
+        )
+        tracker.record_step_start(record)
+        tracker.record_step_failed(record, "Disk full", result=result)
+
+        import polars as pl
+
+        df = pl.read_delta(str(tmp_path / "orchestration/steps"))
+        failed = df.filter(pl.col("status") == "failed")
+        row = failed.row(0, named=True)
+        assert row["total_count"] == 4
+        assert row["succeeded_count"] == 3
+        assert row["failed_count"] == 1
+        assert row["commit_error"] == "Disk full"
+
 
 class TestLoadCompletedSteps:
     """Tests for StepTracker.load_completed_steps()."""

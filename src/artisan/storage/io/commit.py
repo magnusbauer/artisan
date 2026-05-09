@@ -57,6 +57,29 @@ def _get_commit_order() -> list[str]:
     return [*artifact_paths, *framework_paths]
 
 
+class CommitFailureError(RuntimeError):
+    """Raised when a staged execution directory cannot be fully committed."""
+
+    def __init__(
+        self,
+        *,
+        execution_run_id: str,
+        run_dir: str,
+        table_name: str,
+        cause: Exception | str,
+        partial_results: dict[str, int] | None = None,
+    ) -> None:
+        self.execution_run_id = execution_run_id
+        self.run_dir = run_dir
+        self.table_name = table_name
+        self.partial_results = partial_results or {}
+        detail = cause if isinstance(cause, str) else f"{type(cause).__name__}: {cause}"
+        super().__init__(
+            f"Commit failed for execution_run_id={execution_run_id} "
+            f"at table={table_name}: {detail}"
+        )
+
+
 class DeltaCommitter:
     """Commit staged Parquet files to Delta Lake tables.
 
@@ -98,6 +121,29 @@ class DeltaCommitter:
         """Check if the table supports artifact_id deduplication."""
         return _to_str(table) != _to_str(TablePath.EXECUTION_EDGES)
 
+    def _default_partition_by(self, table: str) -> list[str] | None:
+        """Return the default partition columns for a table."""
+        if self._is_non_partitioned(table):
+            return None
+        return ["origin_step_number"]
+
+    def _dedupe_key_column(self, table: str, df: pl.DataFrame) -> str | None:
+        """Return the primary dedupe key for a staged table."""
+        table_str = _to_str(table)
+        if (
+            table_str
+            in {
+                TablePath.EXECUTIONS.value,
+                TablePath.EXECUTION_EDGES.value,
+                TablePath.ARTIFACT_EDGES.value,
+            }
+            and "execution_run_id" in df.columns
+        ):
+            return "execution_run_id"
+        if "artifact_id" in df.columns and self._has_artifact_id(table):
+            return "artifact_id"
+        return None
+
     # -------------------------------------------------------------------------
     # Commit operations
     # -------------------------------------------------------------------------
@@ -137,51 +183,67 @@ class DeltaCommitter:
         if staged_df is None or staged_df.is_empty():
             return 0
 
-        table_path = self._table_path(_to_str(table))
+        return self.commit_dataframe(
+            staged_df,
+            table,
+            deduplicate=deduplicate,
+            partition_by=partition_by,
+        )
 
-        # Default partition: all tables use origin_step_number except
-        # non-partitioned tables
-        if partition_by is None:
-            if self._is_non_partitioned(table):
-                partition_by = None
-            else:
-                partition_by = ["origin_step_number"]
+    def commit_execution_run_dir(
+        self,
+        run_dir: str,
+        *,
+        cleanup_after: bool = True,
+    ) -> dict[str, int]:
+        """Commit a single staged execution directory to Delta Lake.
 
-        # Handle deduplication for artifact tables
-        if (
-            deduplicate
-            and "artifact_id" in staged_df.columns
-            and self._has_artifact_id(table)
-        ):
-            staged_df = self._deduplicate_artifacts(staged_df, table_path)
-            if staged_df.is_empty():
-                return 0
+        The directory must contain ``executions.parquet`` to be treated
+        as a complete execution record. On any failure, the directory is
+        preserved so recovery can retry safely.
+        """
+        clean_run_dir = run_dir.rstrip("/")
+        if not self._fs.exists(clean_run_dir):
+            return {}
 
-        # Write to Delta Lake with zstd compression
-        if self._fs.exists(table_path):
-            staged_df.write_delta(
-                table_path,
-                mode="append",
-                delta_write_options={
-                    "writer_properties": DEFAULT_WRITER_PROPERTIES,
-                    "schema_mode": "merge",
-                },
-                storage_options=self._storage_options,
-            )
-        else:
-            write_opts: dict[str, Any] = {
-                "writer_properties": DEFAULT_WRITER_PROPERTIES
-            }
-            if partition_by:
-                write_opts["partition_by"] = partition_by
-            staged_df.write_delta(
-                table_path,
-                mode="overwrite",
-                delta_write_options=write_opts,
-                storage_options=self._storage_options,
+        execution_run_id = _table_name_from_path(clean_run_dir)
+        executions_uri = f"{clean_run_dir}/executions.parquet"
+        if not self._fs.exists(executions_uri):
+            raise CommitFailureError(
+                execution_run_id=execution_run_id,
+                run_dir=clean_run_dir,
+                table_name="executions",
+                cause="missing required executions.parquet",
             )
 
-        return staged_df.shape[0]
+        results: dict[str, int] = {}
+        for table in _get_commit_order():
+            table_name = _table_name_from_path(_to_str(table))
+            try:
+                staged_df = self.staging_manager.read_staged_table(
+                    clean_run_dir, table_name
+                )
+                if staged_df is None or staged_df.is_empty():
+                    continue
+                rows_committed = self.commit_dataframe(staged_df, table)
+            except CommitFailureError:
+                raise
+            except Exception as exc:
+                raise CommitFailureError(
+                    execution_run_id=execution_run_id,
+                    run_dir=clean_run_dir,
+                    table_name=table_name,
+                    cause=exc,
+                    partial_results=results,
+                ) from exc
+
+            if rows_committed > 0:
+                results[table_name] = rows_committed
+
+        if cleanup_after:
+            self.staging_manager.cleanup_execution_run_dir(clean_run_dir)
+
+        return results
 
     def commit_all_tables(
         self,
@@ -206,50 +268,33 @@ class DeltaCommitter:
 
         Returns:
             Mapping of table name to rows committed. Tables with zero
-            rows are omitted. A ``_failed_tables`` key is present when
-            any table commit raised an exception.
+            rows are omitted.
+
+        Raises:
+            CommitFailureError: If any staged execution directory fails
+                to commit. Successful sibling directories are preserved
+                only according to ``cleanup_staging``.
         """
-        results: dict[str, Any] = {}
-        failed_tables: list[tuple[str, str]] = []
+        results: dict[str, int] = {}
+        run_dirs = self.staging_manager.iter_execution_run_dirs(
+            step_number=step_number,
+            operation_name=operation_name,
+        )
+        if not run_dirs:
+            return results
 
-        for table in _get_commit_order():
-            table_name = _table_name_from_path(_to_str(table))
-            try:
-                rows_committed = self.commit_table(
-                    table,
-                    step_number=step_number,
-                    operation_name=operation_name,
-                )
-                if rows_committed > 0:
-                    results[table_name] = rows_committed
-            except Exception as exc:
-                logger.error(
-                    "Failed to commit table %s: %s: %s",
-                    table_name,
-                    type(exc).__name__,
-                    exc,
-                )
-                failed_tables.append((table_name, str(exc)))
-
-        if failed_tables:
-            results["_failed_tables"] = failed_tables
+        for run_dir in run_dirs:
+            run_results = self.commit_execution_run_dir(
+                run_dir,
+                cleanup_after=cleanup_staging,
+            )
+            for table_name, rows_committed in run_results.items():
+                results[table_name] = results.get(table_name, 0) + rows_committed
 
         if results:
-            parts = [
-                f"{name}={count}"
-                for name, count in results.items()
-                if not name.startswith("_")
-            ]
+            parts = [f"{name}={count}" for name, count in results.items()]
             if parts:
                 logger.debug("Step %d commit: %s", step_number or 0, ", ".join(parts))
-
-        if cleanup_staging:
-            if step_number is not None:
-                self.staging_manager.cleanup_step(
-                    step_number, operation_name=operation_name
-                )
-            else:
-                self.staging_manager.cleanup_all()
 
         return results
 
@@ -270,13 +315,13 @@ class DeltaCommitter:
         if not self._fs.exists(self.staging_manager.staging_dir):
             return {}
 
-        probe = self.staging_manager.get_staged_files_for_table("executions")
-        if not probe:
+        run_dirs = self.staging_manager.iter_execution_run_dirs()
+        if not run_dirs:
             return {}
 
         logger.debug(
-            "Staged recovery: found %d leftover execution file(s), committing...",
-            len(probe),
+            "Staged recovery: found %d leftover staged run directorie(s), committing...",
+            len(run_dirs),
         )
 
         results = self.commit_all_tables(
@@ -284,9 +329,8 @@ class DeltaCommitter:
             step_number=None,
         )
 
-        committed = {k: v for k, v in results.items() if not k.startswith("_")}
-        if committed:
-            parts = [f"{name}={count}" for name, count in committed.items()]
+        if results:
+            parts = [f"{name}={count}" for name, count in results.items()]
             logger.debug("Staged recovery committed: %s", ", ".join(parts))
         else:
             logger.debug("Staged recovery: no new rows to commit")
@@ -331,27 +375,38 @@ class DeltaCommitter:
     # Helper methods
     # -------------------------------------------------------------------------
 
-    def _deduplicate_artifacts(self, df: pl.DataFrame, table_path: str) -> pl.DataFrame:
-        """Remove rows whose artifact_id already exists in Delta."""
+    def _deduplicate_rows(
+        self,
+        df: pl.DataFrame,
+        table_path: str,
+        key_column: str,
+    ) -> pl.DataFrame:
+        """Remove rows whose dedupe key already exists in Delta."""
         if not self._fs.exists(table_path):
+            return df
+
+        key_values = df.get_column(key_column).drop_nulls().unique().to_list()
+        if not key_values:
             return df
 
         existing_ids = (
             pl.scan_delta(table_path, storage_options=self._storage_options)
-            .select("artifact_id")
+            .filter(pl.col(key_column).is_in(key_values))
+            .select(key_column)
             .collect()
         )
 
         if existing_ids.is_empty():
             return df
 
-        return df.join(existing_ids, on="artifact_id", how="anti")
+        return df.join(existing_ids, on=key_column, how="anti")
 
     def commit_dataframe(
         self,
         df: pl.DataFrame,
         table: str,
         deduplicate: bool = True,
+        partition_by: list[str] | None = None,
     ) -> int:
         """Write a single DataFrame directly to a Delta table.
 
@@ -359,8 +414,10 @@ class DeltaCommitter:
             df: Data to write (appended to existing table or creates
                 a new one).
             table: Target table path string or ``TablePath`` member.
-            deduplicate: Skip rows whose ``artifact_id`` already
-                exists in the target table.
+            deduplicate: Skip rows whose primary key already exists in
+                the target table.
+            partition_by: Partition columns. Defaults to
+                ``["origin_step_number"]`` for partitioned tables.
 
         Returns:
             Number of rows written. Zero when the DataFrame is empty
@@ -368,14 +425,14 @@ class DeltaCommitter:
         """
         table_path = self._table_path(_to_str(table))
 
-        if deduplicate and "artifact_id" in df.columns and self._has_artifact_id(table):
-            df = self._deduplicate_artifacts(df, table_path)
+        dedupe_key = self._dedupe_key_column(table, df)
+        if deduplicate and dedupe_key is not None:
+            df = self._deduplicate_rows(df, table_path, dedupe_key)
             if df.is_empty():
                 return 0
 
-        partition_by = (
-            ["origin_step_number"] if not self._is_non_partitioned(table) else None
-        )
+        if partition_by is None:
+            partition_by = self._default_partition_by(table)
 
         if self._fs.exists(table_path):
             df.write_delta(

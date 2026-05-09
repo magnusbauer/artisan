@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import posixpath
 import uuid
+from contextlib import suppress
 
 import polars as pl
 from fsspec import AbstractFileSystem
@@ -189,6 +190,60 @@ class StagingManager:
             and not posixpath.basename(e.rstrip("/")).startswith(".")
         ]
 
+    def _invalidate_cache(self, path: str) -> None:
+        """Best-effort filesystem metadata cache invalidation."""
+        invalidate = getattr(self._fs, "invalidate_cache", None)
+        if invalidate is None:
+            return
+        with suppress(AttributeError, NotImplementedError, OSError):
+            invalidate(path)
+
+    def _scope_root(
+        self,
+        step_number: int | None = None,
+        operation_name: str | None = None,
+    ) -> str | None:
+        """Resolve the staging subtree for a step-scoped query."""
+        self._invalidate_cache(self.staging_dir)
+        if not self._fs.exists(self.staging_dir):
+            return None
+
+        if step_number is None:
+            return self.staging_dir
+
+        if operation_name is not None:
+            step_dir = (
+                f"{self.staging_dir}/{step_dir_name(step_number, operation_name)}"
+            )
+        else:
+            step_dir = f"{self.staging_dir}/{step_number}"
+
+        self._invalidate_cache(step_dir)
+        if not self._fs.exists(step_dir):
+            return None
+        return step_dir
+
+    def iter_execution_run_dirs(
+        self,
+        step_number: int | None = None,
+        operation_name: str | None = None,
+    ) -> list[str]:
+        """Return staged leaf directories that contain Parquet files.
+
+        Supports both legacy flat batch directories and the current
+        sharded execution-run layout.
+        """
+        scope_root = self._scope_root(
+            step_number=step_number,
+            operation_name=operation_name,
+        )
+        if scope_root is None:
+            return []
+
+        parquet_files = self._fs.glob(f"{scope_root}/**/*.parquet")
+        run_dirs = {posixpath.dirname(path.rstrip("/")) for path in parquet_files}
+        return sorted(run_dirs)
+
     def get_staged_files_for_table(
         self,
         table_name: str,
@@ -211,25 +266,32 @@ class StagingManager:
             URIs of matching Parquet files. Empty list when the
             staging directory does not exist.
         """
-        if not self._fs.exists(self.staging_dir):
+        scope_root = self._scope_root(
+            step_number=step_number,
+            operation_name=operation_name,
+        )
+        if scope_root is None:
             return []
 
-        if step_number is not None:
-            if operation_name is not None:
-                step_dir = (
-                    f"{self.staging_dir}/{step_dir_name(step_number, operation_name)}"
-                )
-            else:
-                step_dir = f"{self.staging_dir}/{step_number}"
-            if not self._fs.exists(step_dir):
-                return []
-            matches: list[str] = self._fs.glob(f"{step_dir}/**/{table_name}.parquet")
-            return matches
+        matches: list[str] = self._fs.glob(f"{scope_root}/**/{table_name}.parquet")
+        return matches
 
-        all_matches: list[str] = self._fs.glob(
-            f"{self.staging_dir}/**/{table_name}.parquet"
-        )
-        return all_matches
+    def read_staged_table(
+        self,
+        run_dir: str,
+        table_name: str,
+    ) -> pl.DataFrame | None:
+        """Read one staged Parquet table from a specific run directory.
+
+        Raises:
+            Any exception from ``polars.read_parquet`` when the file is
+            present but unreadable.
+        """
+        parquet_uri = f"{run_dir.rstrip('/')}/{table_name}.parquet"
+        if not self._fs.exists(parquet_uri):
+            return None
+        with self._fs.open(parquet_uri, "rb") as f:
+            return pl.read_parquet(f)
 
     def read_all_staged_for_table(
         self,
@@ -282,6 +344,25 @@ class StagingManager:
         batch_dir = f"{self.staging_dir}/{batch_id}"
         if self._fs.exists(batch_dir):
             self._fs.rm(batch_dir, recursive=True)
+
+    def cleanup_execution_run_dir(self, run_dir: str) -> None:
+        """Remove one staged run directory and prune empty local parents."""
+        clean_run_dir = run_dir.rstrip("/")
+        if self._fs.exists(clean_run_dir):
+            self._fs.rm(clean_run_dir, recursive=True)
+
+        staging_root = self.staging_dir.rstrip("/")
+        parent = posixpath.dirname(clean_run_dir)
+        while parent and parent != staging_root and parent.startswith(staging_root):
+            try:
+                if not self._fs.exists(parent):
+                    break
+                if self._fs.ls(parent, detail=False):
+                    break
+                self._fs.rm(parent, recursive=True)
+            except (FileNotFoundError, OSError):
+                break
+            parent = posixpath.dirname(parent)
 
     def cleanup_step(self, step_number: int, operation_name: str | None = None) -> None:
         """Remove all staging directories for a given step.

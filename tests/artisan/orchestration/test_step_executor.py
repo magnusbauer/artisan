@@ -1297,7 +1297,9 @@ class TestCommitFailureHandling:
         )
 
         assert "commit_error" in result.metadata
+        assert result.metadata["terminal_failure"] == "commit"
         assert "Disk full" in result.metadata["commit_error"]
+        assert result.success is False
         # succeeded/failed counts come from dispatch, not commit
         assert result.succeeded_count == 1
 
